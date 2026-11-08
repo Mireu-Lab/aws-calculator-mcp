@@ -84,15 +84,15 @@ func runEC2CLI(args []string) {
 	}
 
 	res := map[string]interface{}{
-		"service":                "Amazon EC2 & EBS",
-		"instance_type":          *instanceType,
-		"instance_count":         *count,
-		"hours_per_month":        *hours,
-		"ebs_gb":                 *ebsGB,
-		"is_spot":                *isSpot,
-		"monthly_cost_usd":       totalUSD,
-		"monthly_cost_krw":       int(totalUSD * krwRate),
-		"exchange_rate_usd_krw":  krwRate,
+		"service":               "Amazon EC2 & EBS",
+		"instance_type":         *instanceType,
+		"instance_count":        *count,
+		"hours_per_month":       *hours,
+		"ebs_gb":                *ebsGB,
+		"is_spot":               *isSpot,
+		"monthly_cost_usd":      totalUSD,
+		"monthly_cost_krw":      int(totalUSD * krwRate),
+		"exchange_rate_usd_krw": krwRate,
 		"cost_optimization_tip": "Use Compute Savings Plans or Spot instances for up to 70% savings",
 	}
 	printJSON(res)

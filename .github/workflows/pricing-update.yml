@@ -1,0 +1,46 @@
+name: Scheduled Quarterly Pricing & Catalog Update
+
+on:
+  schedule:
+    # Runs at 00:00 UTC on the 1st of January, April, July, and October (Every 3 months)
+    - cron: '0 0 1 1,4,7,10 *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  update-pricing:
+    name: Fetch Latest AWS Bulk Pricing & Update Catalog
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+          check-latest: true
+
+      - name: Run AWS Bulk Price List Streaming ETL
+        run: |
+          echo "Starting quarterly AWS Bulk Pricing synchronization..."
+          TIMESTAMP=$(date -u +"%Y-%m-%d %H:%M:%S UTC")
+          echo "[$TIMESTAMP] Running streaming ETL for AmazonEC2, AmazonRDS, AmazonS3..." >> pricing_update.log
+          go run ./cmd/etl
+          go build -v -o bin/aws-calculator-mcp .
+          ./bin/aws-calculator-mcp pricing || true
+
+      - name: Commit and Push Changes
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          if [ -n "$(git status --porcelain)" ]; then
+            git add .
+            git commit -m "chore(pricing): quarterly automated AWS catalog and pricing update [skip ci]"
+            git push origin main
+          else
+            echo "No pricing catalog changes detected."
+          fi
