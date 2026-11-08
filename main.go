@@ -1,219 +1,201 @@
 package main
 
 import (
-	"encoding/csv"
 	"encoding/json"
+	"flag"
 	"fmt"
-	"io"
-	"log"
-	"net/http"
 	"os"
-	"strings"
-	"time"
+
+	"aws-calculator-mcp/calculator"
+	"aws-calculator-mcp/mcp"
 )
 
-// Price List Bulk API 리전별 엔드포인트 기본 경로
-const baseURL = "https://pricing.us-east-1.amazonaws.com/offers/v1.0/aws"
-
-// 추출 대상 서비스 목록
-var targetServices = []string{"AmazonEC2", "AmazonRDS", "AmazonS3"}
-
-// 정규화된 카탈로그 레코드 구조체
-type CatalogRecord struct {
-	SKU             string
-	ServiceCode     string
-	ProductFamily   string
-	RegionCode      string
-	InstanceType    string
-	VCPU            string
-	MemoryGiB       string
-	StorageType     string
-	UsageType       string
-	Operation       string
-	PurchaseOption  string
-	Unit            string
-	PricePerUnitUSD string
-	Description     string
-}
-
-// AWS Bulk Price List 내부 JSON 구조 매핑
-type BulkOfferPayload struct {
-	FormatVersion string                 `json:"formatVersion"`
-	Disclaimer    string                 `json:"disclaimer"`
-	OfferCode     string                 `json:"offerCode"`
-	Products      map[string]ProductItem `json:"products"`
-	Terms         TermsContainer         `json:"terms"`
-}
-
-type ProductItem struct {
-	SKU           string                 `json:"sku"`
-	ProductFamily string                 `json:"productFamily"`
-	Attributes    map[string]interface{} `json:"attributes"`
-}
-
-type TermsContainer struct {
-	OnDemand map[string]map[string]TermOffer `json:"OnDemand"`
-}
-
-type TermOffer struct {
-	OfferTermCode   string                    `json:"offerTermCode"`
-	SKU             string                    `json:"sku"`
-	PriceDimensions map[string]PriceDimension `json:"priceDimensions"`
-}
-
-type PriceDimension struct {
-	RateCode     string            `json:"rateCode"`
-	Description  string            `json:"description"`
-	BeginRange   string            `json:"beginRange"`
-	EndRange     string            `json:"endRange"`
-	Unit         string            `json:"unit"`
-	PricePerUnit map[string]string `json:"pricePerUnit"`
-}
-
 func main() {
-	outputFilename := "AWS-Comprehensive-Catalog.tsv"
-	region := "ap-northeast-2" // 서울 리전 기본 설정
-
-	outFile, err := os.Create(outputFilename)
-	if err != nil {
-		log.Fatalf("출력 파일 생성 실패: %v", err)
-	}
-	defer outFile.Close()
-
-	tsvWriter := csv.NewWriter(outFile)
-	tsvWriter.Comma = '\t'
-	defer tsvWriter.Flush()
-
-	// TSV 헤더 정의
-	headers := []string{
-		"sku", "service_code", "product_family", "region_code",
-		"instance_type", "vcpu", "memory_gib", "storage_type",
-		"usage_type", "operation", "purchase_option", "unit",
-		"price_per_unit_usd", "description",
-	}
-	if err := tsvWriter.Write(headers); err != nil {
-		log.Fatalf("헤더 작성 실패: %v", err)
-	}
-
-	client := &http.Client{Timeout: 10 * time.Minute}
-
-	for _, service := range targetServices {
-		log.Printf("[%s] 리전(%s) 요금 데이터 다운로드 및 파싱 시작...", service, region)
-		targetURL := fmt.Sprintf("%s/%s/current/%s/index.json", baseURL, service, region)
-
-		resp, err := client.Get(targetURL)
-		if err != nil {
-			log.Printf("[%s] 요청 실패: %v", service, err)
-			continue
+	if len(os.Args) > 1 {
+		subcommand := os.Args[1]
+		switch subcommand {
+		case "ec2", "compute":
+			runEC2CLI(os.Args[2:])
+			return
+		case "rds", "database":
+			runRDSCLI(os.Args[2:])
+			return
+		case "s3", "storage":
+			runS3CLI(os.Args[2:])
+			return
+		case "catalog", "search":
+			runCatalogCLI(os.Args[2:])
+			return
+		case "pricing", "policy":
+			runPolicyCLI()
+			return
+		case "server":
+			runMCPServer()
+			return
+		case "help", "-h", "--help":
+			printHelp()
+			return
+		default:
+			fmt.Printf("Unknown command '%s'. Use --help for usage.\n", subcommand)
+			os.Exit(1)
 		}
-
-		if resp.StatusCode != http.StatusOK {
-			resp.Body.Close()
-			log.Printf("[%s] 잘못된 응답 코드: %d", service, resp.StatusCode)
-			continue
-		}
-
-		records, err := processOfferPayload(resp.Body, service, region)
-		resp.Body.Close()
-		if err != nil {
-			log.Printf("[%s] 데이터 파싱 실패: %v", service, err)
-			continue
-		}
-
-		log.Printf("[%s] %d개 레코드 추출 완료. TSV 기록 중...", service, len(records))
-		for _, r := range records {
-			row := []string{
-				r.SKU, r.ServiceCode, r.ProductFamily, r.RegionCode,
-				r.InstanceType, r.VCPU, r.MemoryGiB, r.StorageType,
-				r.UsageType, r.Operation, r.PurchaseOption, r.Unit,
-				r.PricePerUnitUSD, r.Description,
-			}
-			if err := tsvWriter.Write(row); err != nil {
-				log.Printf("행 기록 실패 (SKU: %s): %v", r.SKU, err)
-			}
-		}
-		tsvWriter.Flush()
 	}
 
-	log.Printf("전체 카탈로그 생성 완료: %s", outputFilename)
+	// Default to MCP server mode if no args provided
+	runMCPServer()
 }
 
-func processOfferPayload(reader io.Reader, serviceCode, defaultRegion string) ([]CatalogRecord, error) {
-	var payload BulkOfferPayload
-	decoder := json.NewDecoder(reader)
-	if err := decoder.Decode(&payload); err != nil {
-		return nil, err
+func runMCPServer() {
+	server := mcp.NewServer(os.Stdin, os.Stdout)
+	if err := server.Start(); err != nil {
+		fmt.Fprintf(os.Stderr, "Server failed: %v\n", err)
+		os.Exit(1)
 	}
-
-	var results []CatalogRecord
-
-	// OnDemand 요금 매핑
-	for sku, termMap := range payload.Terms.OnDemand {
-		prod, exists := payload.Products[sku]
-		if !exists {
-			continue
-		}
-
-		attr := prod.Attributes
-		regionCode := getStringAttr(attr, "regionCode")
-		if regionCode == "" {
-			regionCode = defaultRegion
-		}
-
-		instanceType := getStringAttr(attr, "instanceType")
-		vcpu := getStringAttr(attr, "vcpu")
-		memory := getStringAttr(attr, "memory")
-		storageType := getStringAttr(attr, "volumeType")
-		if storageType == "" {
-			storageType = getStringAttr(attr, "storageClass")
-		}
-		usageType := getStringAttr(attr, "usagetype")
-		operation := getStringAttr(attr, "operation")
-
-		for _, term := range termMap {
-			for _, dim := range term.PriceDimensions {
-				priceUSD := dim.PricePerUnit["USD"]
-				if priceUSD == "" {
-					continue
-				}
-
-				// 정규화된 레코드 생성
-				record := CatalogRecord{
-					SKU:             sku,
-					ServiceCode:     serviceCode,
-					ProductFamily:   prod.ProductFamily,
-					RegionCode:      regionCode,
-					InstanceType:    instanceType,
-					VCPU:            vcpu,
-					MemoryGiB:       normalizeMemory(memory),
-					StorageType:     storageType,
-					UsageType:       usageType,
-					Operation:       operation,
-					PurchaseOption:  "OnDemand",
-					Unit:            dim.Unit,
-					PricePerUnitUSD: priceUSD,
-					Description:     strings.TrimSpace(dim.Description),
-				}
-				results = append(results, record)
-			}
-		}
-	}
-
-	return results, nil
 }
 
-func getStringAttr(attrs map[string]interface{}, key string) string {
-	if val, ok := attrs[key]; ok && val != nil {
-		if s, ok := val.(string); ok {
-			return s
+func runEC2CLI(args []string) {
+	fs := flag.NewFlagSet("ec2", flag.ExitOnError)
+	instanceType := fs.String("instance", "t4g.medium", "EC2 Instance type (e.g., t4g.medium, m6i.xlarge)")
+	count := fs.Int("count", 1, "Number of instances")
+	hours := fs.Float64("hours", 730, "Monthly running hours")
+	ebsGB := fs.Float64("ebs", 50, "EBS storage in GB")
+	isSpot := fs.Bool("spot", false, "Apply Spot discount")
+	fs.Parse(args)
+
+	// Calculation using active policy rates
+	policy := calculator.GetActivePolicy()
+	rate := 0.0416 // default t4g.medium
+	for _, p := range policy.Products {
+		if p.SubService == *instanceType && p.BaseRateUSD > 0 {
+			rate = p.BaseRateUSD
+			break
 		}
 	}
-	return ""
+	if *isSpot {
+		rate *= 0.35 // spot discount
+	}
+
+	computeUSD := rate * (*hours) * float64(*count)
+	ebsUSD := (*ebsGB) * 0.096 * float64(*count)
+	totalUSD := computeUSD + ebsUSD
+	krwRate := policy.CurrencyExchange["USD_TO_KRW"]
+	if krwRate == 0 {
+		krwRate = 1350.0
+	}
+
+	res := map[string]interface{}{
+		"service":                "Amazon EC2 & EBS",
+		"instance_type":          *instanceType,
+		"instance_count":         *count,
+		"hours_per_month":        *hours,
+		"ebs_gb":                 *ebsGB,
+		"is_spot":                *isSpot,
+		"monthly_cost_usd":       totalUSD,
+		"monthly_cost_krw":       int(totalUSD * krwRate),
+		"exchange_rate_usd_krw":  krwRate,
+		"cost_optimization_tip": "Use Compute Savings Plans or Spot instances for up to 70% savings",
+	}
+	printJSON(res)
 }
 
-func normalizeMemory(memStr string) string {
-	memStr = strings.TrimSpace(memStr)
-	memStr = strings.ReplaceAll(memStr, "GiB", "")
-	memStr = strings.ReplaceAll(memStr, "GB", "")
-	return strings.TrimSpace(memStr)
+func runRDSCLI(args []string) {
+	fs := flag.NewFlagSet("rds", flag.ExitOnError)
+	instance := fs.String("instance", "db.t4g.medium", "RDS DB instance type")
+	storageGB := fs.Float64("storage", 100, "Allocated storage GB")
+	multiAZ := fs.Bool("multi-az", false, "Enable Multi-AZ deployment")
+	fs.Parse(args)
+
+	policy := calculator.GetActivePolicy()
+	baseUSD := 0.068 * 730.0 // db.t4g.medium single AZ approx
+	if *multiAZ {
+		baseUSD *= 2.0
+	}
+	storageUSD := (*storageGB) * 0.115
+	totalUSD := baseUSD + storageUSD
+	krwRate := policy.CurrencyExchange["USD_TO_KRW"]
+	if krwRate == 0 {
+		krwRate = 1350.0
+	}
+
+	res := map[string]interface{}{
+		"service":               "Amazon RDS",
+		"db_instance":           *instance,
+		"multi_az":              *multiAZ,
+		"storage_gb":            *storageGB,
+		"monthly_cost_usd":      totalUSD,
+		"monthly_cost_krw":      int(totalUSD * krwRate),
+		"exchange_rate_usd_krw": krwRate,
+	}
+	printJSON(res)
+}
+
+func runS3CLI(args []string) {
+	fs := flag.NewFlagSet("s3", flag.ExitOnError)
+	gb := fs.Float64("gb", 1000, "Total storage in GB")
+	class := fs.String("class", "standard", "standard, glacier, deep-archive")
+	fs.Parse(args)
+
+	policy := calculator.GetActivePolicy()
+	rate := 0.025
+	switch *class {
+	case "glacier":
+		rate = 0.0045
+	case "deep-archive":
+		rate = 0.0020
+	}
+
+	totalUSD := (*gb) * rate
+	krwRate := policy.CurrencyExchange["USD_TO_KRW"]
+	if krwRate == 0 {
+		krwRate = 1350.0
+	}
+
+	res := map[string]interface{}{
+		"service":               "Amazon S3",
+		"storage_class":         *class,
+		"storage_gb":            *gb,
+		"monthly_cost_usd":      totalUSD,
+		"monthly_cost_krw":      int(totalUSD * krwRate),
+		"exchange_rate_usd_krw": krwRate,
+	}
+	printJSON(res)
+}
+
+func runCatalogCLI(args []string) {
+	fs := flag.NewFlagSet("catalog", flag.ExitOnError)
+	query := fs.String("query", "", "Filter query")
+	fs.Parse(args)
+
+	products := calculator.GetFullCatalog()
+	if *query != "" {
+		products = calculator.SearchCatalog(*query)
+	}
+	printJSON(products)
+}
+
+func runPolicyCLI() {
+	policy := calculator.GetActivePolicy()
+	printJSON(policy)
+}
+
+func printJSON(v interface{}) {
+	b, _ := json.MarshalIndent(v, "", "  ")
+	fmt.Println(string(b))
+}
+
+func printHelp() {
+	helpText := `AWS Pricing Calculator MCP Server & CLI Tool (Golang)
+
+Usage:
+  aws-calculator-mcp [command] [flags]
+
+Commands:
+  server      Run as MCP stdio server (default)
+  ec2         Calculate EC2 Compute costs (Instances, EBS, Spot)
+  rds         Calculate RDS Database costs
+  s3          Calculate S3 Storage costs
+  catalog     Search products in catalog
+  pricing     Display active pricing policy rates
+`
+	fmt.Println(helpText)
 }
